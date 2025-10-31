@@ -22,6 +22,13 @@ import multiprocessing as mp
 from threading import Lock
 import queue
 
+# Global error tracking for suppressing repetitive warnings
+ERROR_COUNTS = defaultdict(int)
+ERROR_SUPPRESSION_THRESHOLD = 5
+
+# Global patient scan cache to prevent re-scanning
+PATIENT_SCAN_CACHE = {}
+
 
 # --- Data Classes ---
 @dataclass
@@ -738,6 +745,24 @@ def handle_dicom_error(func):
     return wrapper
 
 
+# --- Error Suppression Functions ---
+def log_parsing_error_once(error_type: str, sample_uid: str, logger_instance):
+    """Log parsing errors only once with counting to reduce log spam."""
+    global ERROR_COUNTS, ERROR_SUPPRESSION_THRESHOLD
+    
+    ERROR_COUNTS[error_type] += 1
+    
+    # Log only first few errors of each type
+    if ERROR_COUNTS[error_type] <= ERROR_SUPPRESSION_THRESHOLD:
+        logger_instance.warning(f"Parsing error ({error_type}): {sample_uid}")
+    elif ERROR_COUNTS[error_type] == ERROR_SUPPRESSION_THRESHOLD + 1:
+        logger_instance.warning(f"Suppressing further '{error_type}' errors (total so far: {ERROR_COUNTS[error_type]})")
+
+def get_error_suppression_summary():
+    """Get summary of suppressed errors."""
+    global ERROR_COUNTS
+    return dict(ERROR_COUNTS)
+
 # --- Utility Functions ---
 def setup_logging(log_file_path: str):
     """Set up logging to console (INFO) and file (DEBUG)."""
@@ -841,6 +866,28 @@ def clear_dicom_cache():
     _cached_dicom_header.cache_clear()
     logger.info("DICOM header cache cleared")
 
+def clear_patient_scan_cache():
+    """Clear the patient scan cache to free memory."""
+    global PATIENT_SCAN_CACHE
+    cache_size = len(PATIENT_SCAN_CACHE)
+    PATIENT_SCAN_CACHE.clear()
+    logger.info(f"Patient scan cache cleared ({cache_size} entries)")
+
+def get_cache_statistics():
+    """Get current cache statistics for monitoring."""
+    dicom_cache_info = _cached_dicom_header.cache_info()
+    patient_cache_size = len(PATIENT_SCAN_CACHE)
+    error_counts = get_error_suppression_summary()
+    
+    return {
+        'dicom_cache_hits': dicom_cache_info.hits,
+        'dicom_cache_misses': dicom_cache_info.misses,
+        'dicom_cache_size': dicom_cache_info.currsize,
+        'patient_cache_size': patient_cache_size,
+        'total_errors_suppressed': sum(error_counts.values()),
+        'error_types': len(error_counts)
+    }
+
 
 @measure 
 def is_dicom_file(file_path: str) -> bool:
@@ -865,17 +912,29 @@ class DicomScanner:
         self.progress_lock = Lock()
         self.progress_counter = 0
         self.total_files = 0
+        # PERFORMANCE FIX: Add patient-level caching to prevent re-scanning
+        self.patient_scan_results = {}
+        self.scan_start_time = None
 
     @measure(capture_args=True)
     def scan_directory(self, input_dir: str) -> Dict[str, PatientData]:
         """Scan directory and collect DICOM metadata with parallel processing."""
         logger.info("Phase 1: Scanning DICOM files and collecting metadata...")
         
+        # PERFORMANCE FIX: Track scanning performance
+        self.scan_start_time = time.time()
+        
         # Начало фазы
         profiler.record_phase("phase_1_scanning", "start")
         profiler.memory_checkpoint("scan_start")
         
         collected_data = {}
+        
+        # PERFORMANCE FIX: Check if we can use cached results
+        cache_key = f"scan_{os.path.abspath(input_dir)}"
+        if cache_key in PATIENT_SCAN_CACHE:
+            logger.info("  Using cached scan results from previous run")
+            return PATIENT_SCAN_CACHE[cache_key]
         
         # Шаг 1: Собираем все файлы для обработки
         logger.info("  Collecting file list...")
@@ -887,6 +946,11 @@ class DicomScanner:
         
         self.total_files = len(all_files)
         logger.info(f"  Found {self.total_files} total files to process")
+        
+        # PERFORMANCE FIX: Log estimated processing time based on previous runs
+        if self.total_files > 0:
+            estimated_time = self.total_files / 40  # Based on observed ~40 files/sec
+            logger.info(f"  Estimated processing time: {estimated_time:.1f} seconds")
         
         # Шаг 2: Параллельная обработка файлов
         logger.info("  Processing files in parallel...")
@@ -920,11 +984,30 @@ class DicomScanner:
                     file_path = future_to_file[future]
                     logger.error(f"Error processing file {file_path}: {e}")
         
+        # PERFORMANCE FIX: Cache results and log performance metrics
+        PATIENT_SCAN_CACHE[cache_key] = collected_data
+        
+        # Calculate and log performance metrics
+        scan_duration = time.time() - self.scan_start_time
+        files_per_second = processed_count / scan_duration if scan_duration > 0 else 0
+        
+        # Log error suppression summary
+        error_summary = get_error_suppression_summary()
+        if error_summary:
+            total_suppressed = sum(error_summary.values())
+            logger.info(f"  Error suppression summary: {total_suppressed} total errors")
+            for error_type, count in error_summary.items():
+                if count > ERROR_SUPPRESSION_THRESHOLD:
+                    logger.info(f"    {error_type}: {count} occurrences (suppressed after {ERROR_SUPPRESSION_THRESHOLD})")
+        
         # Конец фазы
         profiler.record_phase("phase_1_scanning", "end")
         profiler.memory_checkpoint("scan_end")
         
         logger.info(f"Phase 1 completed. Total files processed: {processed_count}.")
+        logger.info(f"  Processing speed: {files_per_second:.1f} files/second")
+        logger.info(f"  Total scan duration: {scan_duration:.1f} seconds")
+        
         return collected_data
     
     @measure
@@ -995,9 +1078,10 @@ class DicomScanner:
             return None
         
         study_date_str = get_dicom_value(ds, (0x0008, 0x0020), "00000000")
-        study_time_raw = get_dicom_value(ds, (0x0008, 0x0030), "000000.000000")
+        study_time_raw = get_dicom_value(ds, (0x0008, 0x0030), "")
         
-        # Robust time parsing - handle missing or malformed time
+        # PERFORMANCE FIX: Robust time parsing with error suppression
+        # Handle missing or malformed time without excessive logging
         if isinstance(study_time_raw, str) and study_time_raw:
             study_time_str = study_time_raw.split('.')[0]
             # Ensure time has at least 6 digits (HHMMSS)
@@ -1016,8 +1100,10 @@ class DicomScanner:
                 study_datetime = datetime.strptime(f"{study_date_str[:8]}{study_time_str[:6]}", "%Y%m%d%H%M%S")
             else:
                 study_datetime = datetime.min
-        except ValueError as e:
-            logger.warning(f"Invalid date/time parsing: date='{study_date_str}', time='{study_time_str}' for {study_uid}. Error: {e}")
+        except ValueError:
+            # PERFORMANCE FIX: Use error suppression to reduce log spam
+            error_key = f"invalid_datetime_{study_date_str}_{study_time_str[:6] if len(study_time_str) >= 6 else study_time_str}"
+            log_parsing_error_once(error_key, study_uid, logger)
             study_datetime = datetime.min
         
         series_num_val = get_dicom_value(ds, (0x0020, 0x0011))
@@ -1980,11 +2066,33 @@ class BidsOrganizer:
     
     def _write_mapping_files(self, logs_dir: str):
         """Write mapping and failed cases files to logs directory."""
+        # PERFORMANCE FIX: Log cache statistics and performance metrics
+        cache_stats = get_cache_statistics()
+        logger.info("=" * 50)
+        logger.info("PERFORMANCE STATISTICS")
+        logger.info("=" * 50)
+        logger.info(f"DICOM Cache Performance:")
+        logger.info(f"  Cache hits: {cache_stats['dicom_cache_hits']}")
+        logger.info(f"  Cache misses: {cache_stats['dicom_cache_misses']}")
+        logger.info(f"  Cache size: {cache_stats['dicom_cache_size']} entries")
+        if cache_stats['dicom_cache_hits'] + cache_stats['dicom_cache_misses'] > 0:
+            hit_rate = cache_stats['dicom_cache_hits'] / (cache_stats['dicom_cache_hits'] + cache_stats['dicom_cache_misses']) * 100
+            logger.info(f"  Hit rate: {hit_rate:.1f}%")
+        
+        logger.info(f"Patient Scan Cache:")
+        logger.info(f"  Cached results: {cache_stats['patient_cache_size']} datasets")
+        
+        logger.info(f"Error Suppression:")
+        logger.info(f"  Total errors suppressed: {cache_stats['total_errors_suppressed']}")
+        logger.info(f"  Error types encountered: {cache_stats['error_types']}")
+        logger.info("=" * 50)
+        
         # Write patient and session mapping file
         mapping_file = os.path.join(logs_dir, 'bids_mapping.json')
         mapping_data = {
             'patients': self.patient_mapping,
-            'sessions': self.session_mapping
+            'sessions': self.session_mapping,
+            'performance_stats': cache_stats  # Include performance data
         }
         
         try:

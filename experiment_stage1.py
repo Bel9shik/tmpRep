@@ -194,6 +194,7 @@ class Stage1Experiment(ExperimentBase):
         organizer = BidsOrganizer(
             str(self.output_dir / "rawdata"),
             self.action,
+            max_parallel_files=1,
             max_workers=self.max_workers,
             metrics_callback=self._on_patient_processed,
             streaming_mode=self.streaming_mode  # PERFORMANCE FIX: Pass streaming mode
