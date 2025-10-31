@@ -1107,15 +1107,12 @@ def process_patient_worker(args):
             )
             
             for series_uid, series_info in study_info['series'].items():
-                # PERFORMANCE FIX: Use cached dataset instead of re-reading
-                # The dataset was already read during scanning phase
-                cached_dataset = series_info.get('cached_dataset')
+                # PERFORMANCE FIX: Use cache in worker process
+                # Cannot pass Dataset between processes, so read from cache
+                first_file = series_info['files'][0]
+                cached_dataset = _cached_dicom_header(first_file)
                 if cached_dataset is None:
-                    # Fallback: read first file only if not cached
-                    first_file = series_info['files'][0]
-                    cached_dataset = _cached_dicom_header(first_file)
-                    if cached_dataset is None:
-                        continue
+                    continue
                 
                 series = SeriesInfo(
                     uid=series_uid,
@@ -1521,8 +1518,9 @@ class BidsOrganizer:
                         'files': series_info.files,
                         'series_number': series_info.series_number,
                         'protocol_name': series_info.protocol_name,
-                        'series_desc': series_info.series_desc,
-                        'cached_dataset': series_info.first_dataset  # PERFORMANCE FIX: Pass cached dataset
+                        'series_desc': series_info.series_desc
+                        # NOTE: Cannot pass pydicom.Dataset between processes - not serializable
+                        # Will use cache in worker process instead
                     }
             
             patient_tasks.append((
