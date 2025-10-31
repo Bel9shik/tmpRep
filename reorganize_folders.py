@@ -958,31 +958,41 @@ class DicomScanner:
         # PERFORMANCE FIX: Optimized threading for high-memory server
         max_workers = min(64, os.cpu_count() * 4)  # Increased from 32 to 64 for better throughput
         
+        # PERFORMANCE FIX: Lock-free parallel processing with batch collection
+        # Collect all results first, then merge without locks
+        logger.info(f"  Using {max_workers} parallel workers for file processing")
+        
         # Используем ThreadPoolExecutor для I/O-bound задач
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Отправляем задачи на обработку
             future_to_file = {
-                executor.submit(self._process_single_file, file_path): file_path 
+                executor.submit(self._process_single_file, file_path): file_path
                 for file_path in all_files
             }
             
-            # Собираем результаты
+            # PERFORMANCE FIX: Collect results without locks, merge at end
+            all_results = []
             processed_count = 0
+            
             for future in as_completed(future_to_file):
                 try:
                     result = future.result(timeout=30)  # 30 секунд таймаут на файл
                     if result:
-                        self._add_series_info_to_collected(collected_data, result)
+                        all_results.append(result)
                     
-                    # Атомарное обновление счетчика
-                    with self.progress_lock:
-                        processed_count += 1
-                        if processed_count % 500 == 0:
-                            logger.info(f"    Processed {processed_count}/{self.total_files} files...")
+                    processed_count += 1
+                    # Log progress less frequently to reduce I/O overhead
+                    if processed_count % 1000 == 0:
+                        logger.info(f"    Processed {processed_count}/{self.total_files} files...")
                             
                 except Exception as e:
                     file_path = future_to_file[future]
                     logger.error(f"Error processing file {file_path}: {e}")
+        
+        # PERFORMANCE FIX: Single-threaded merge of all results (no locks needed)
+        logger.info(f"  Merging {len(all_results)} results into patient data structure...")
+        for result in all_results:
+            self._add_series_info_to_collected(collected_data, result)
         
         # PERFORMANCE FIX: Cache results and log performance metrics
         PATIENT_SCAN_CACHE[cache_key] = collected_data
@@ -1020,34 +1030,75 @@ class DicomScanner:
         study_uid = series_info['study_uid']
         series_uid = series_info['series_uid']
         
-        # Используем лок для потокобезопасности при модификации shared структуры
+        # PERFORMANCE FIX: Minimize lock contention by preparing data outside lock
+        # Prepare new objects outside the lock
+        new_patient = None
+        new_study = None
+        new_series = None
+        
+        # Check what needs to be created (read-only operations)
+        needs_patient = pat_id not in collected_data
+        needs_study = not needs_patient and study_uid not in collected_data[pat_id].studies
+        needs_series = not needs_study and not needs_patient and series_uid not in collected_data[pat_id].studies[study_uid].series
+        
+        # Prepare objects outside lock
+        if needs_patient:
+            new_patient = PatientData(original_id=pat_id, studies={})
+            new_study = StudyInfo(
+                uid=study_uid,
+                series={},
+                study_datetime=series_info['study_datetime']
+            )
+            new_series = SeriesInfo(
+                uid=series_uid,
+                files=[series_info['file_path']],
+                series_number=series_info['series_number'],
+                study_datetime=series_info['study_datetime'],
+                first_dataset=series_info['dataset'],
+                protocol_name=series_info['protocol_name'],
+                series_desc=series_info['series_desc']
+            )
+        elif needs_study:
+            new_study = StudyInfo(
+                uid=study_uid,
+                series={},
+                study_datetime=series_info['study_datetime']
+            )
+            new_series = SeriesInfo(
+                uid=series_uid,
+                files=[series_info['file_path']],
+                series_number=series_info['series_number'],
+                study_datetime=series_info['study_datetime'],
+                first_dataset=series_info['dataset'],
+                protocol_name=series_info['protocol_name'],
+                series_desc=series_info['series_desc']
+            )
+        elif needs_series:
+            new_series = SeriesInfo(
+                uid=series_uid,
+                files=[series_info['file_path']],
+                series_number=series_info['series_number'],
+                study_datetime=series_info['study_datetime'],
+                first_dataset=series_info['dataset'],
+                protocol_name=series_info['protocol_name'],
+                series_desc=series_info['series_desc']
+            )
+        
+        # PERFORMANCE FIX: Minimal lock time - only for structure updates
         with self.progress_lock:
-            # Initialize patient data if not exists
-            if pat_id not in collected_data:
-                collected_data[pat_id] = PatientData(original_id=pat_id, studies={})
-            
-            # Initialize study data if not exists
-            if study_uid not in collected_data[pat_id].studies:
-                collected_data[pat_id].studies[study_uid] = StudyInfo(
-                    uid=study_uid,
-                    series={},
-                    study_datetime=series_info['study_datetime']
-                )
-            
-            # Initialize series data if not exists
-            if series_uid not in collected_data[pat_id].studies[study_uid].series:
-                collected_data[pat_id].studies[study_uid].series[series_uid] = SeriesInfo(
-                    uid=series_uid,
-                    files=[],
-                    series_number=series_info['series_number'],
-                    study_datetime=series_info['study_datetime'],
-                    first_dataset=series_info['dataset'],
-                    protocol_name=series_info['protocol_name'],
-                    series_desc=series_info['series_desc']
-                )
-            
-            # Add file to series
-            collected_data[pat_id].studies[study_uid].series[series_uid].files.append(series_info['file_path'])
+            # Fast assignments inside lock
+            if needs_patient:
+                new_study.series[series_uid] = new_series
+                new_patient.studies[study_uid] = new_study
+                collected_data[pat_id] = new_patient
+            elif needs_study:
+                new_study.series[series_uid] = new_series
+                collected_data[pat_id].studies[study_uid] = new_study
+            elif needs_series:
+                collected_data[pat_id].studies[study_uid].series[series_uid] = new_series
+            else:
+                # Just append file to existing series
+                collected_data[pat_id].studies[study_uid].series[series_uid].files.append(series_info['file_path'])
     
     @measure
     def _process_single_file(self, file_path: str) -> Optional[Dict]:
