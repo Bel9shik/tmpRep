@@ -814,7 +814,7 @@ def safe_read_dicom(file_path: str, specific_tags: Optional[List] = None) -> Opt
     """Safely read DICOM file with error handling."""
     return pydicom.dcmread(file_path, stop_before_pixels=True, specific_tags=specific_tags)
 
-@lru_cache(maxsize=2048)
+@lru_cache(maxsize=200000)  # PERFORMANCE FIX: Massive cache increase for 128GB RAM server
 def _cached_dicom_header(file_path: str) -> Optional[pydicom.Dataset]:
     """
     Read only the tags we need via mmap.
@@ -832,8 +832,14 @@ def _cached_dicom_header(file_path: str) -> Optional[pydicom.Dataset]:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 return pydicom.filereader.dcmread(mm, stop_before_pixels=True,
                                                   specific_tags=tags)
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Failed to read DICOM header from {file_path}: {e}")
         return None
+
+def clear_dicom_cache():
+    """Clear the DICOM header cache to free memory."""
+    _cached_dicom_header.cache_clear()
+    logger.info("DICOM header cache cleared")
 
 
 @measure 
@@ -885,8 +891,8 @@ class DicomScanner:
         # Шаг 2: Параллельная обработка файлов
         logger.info("  Processing files in parallel...")
         
-        # Оптимальное количество потоков для I/O операций
-        max_workers = min(32, os.cpu_count() * 4)
+        # PERFORMANCE FIX: Optimized threading for high-memory server
+        max_workers = min(64, os.cpu_count() * 4)  # Increased from 32 to 64 for better throughput
         
         # Используем ThreadPoolExecutor для I/O-bound задач
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -989,12 +995,29 @@ class DicomScanner:
             return None
         
         study_date_str = get_dicom_value(ds, (0x0008, 0x0020), "00000000")
-        study_time_str = get_dicom_value(ds, (0x0008, 0x0030), "000000.000000").split('.')[0]
+        study_time_raw = get_dicom_value(ds, (0x0008, 0x0030), "000000.000000")
+        
+        # Robust time parsing - handle missing or malformed time
+        if isinstance(study_time_raw, str) and study_time_raw:
+            study_time_str = study_time_raw.split('.')[0]
+            # Ensure time has at least 6 digits (HHMMSS)
+            if len(study_time_str) < 6:
+                study_time_str = study_time_str.ljust(6, '0')
+        else:
+            study_time_str = "000000"  # Default to midnight if time is missing
+        
+        # Ensure date is valid format
+        if not isinstance(study_date_str, str) or len(study_date_str) < 8:
+            study_date_str = "00000000"
         
         try:
-            study_datetime = datetime.strptime(f"{study_date_str}{study_time_str}", "%Y%m%d%H%M%S")
-        except ValueError:
-            logger.warning(f"Invalid date/time ({study_date_str}/{study_time_str}) for {study_uid}.")
+            # Only try parsing if we have valid date format
+            if study_date_str != "00000000":
+                study_datetime = datetime.strptime(f"{study_date_str[:8]}{study_time_str[:6]}", "%Y%m%d%H%M%S")
+            else:
+                study_datetime = datetime.min
+        except ValueError as e:
+            logger.warning(f"Invalid date/time parsing: date='{study_date_str}', time='{study_time_str}' for {study_uid}. Error: {e}")
             study_datetime = datetime.min
         
         series_num_val = get_dicom_value(ds, (0x0020, 0x0011))
@@ -1084,18 +1107,22 @@ def process_patient_worker(args):
             )
             
             for series_uid, series_info in study_info['series'].items():
-                # Читаем первый файл для получения Dataset
-                first_file = series_info['files'][0]
-                ds = _cached_dicom_header(first_file)
-                if ds is None:
-                    continue
+                # PERFORMANCE FIX: Use cached dataset instead of re-reading
+                # The dataset was already read during scanning phase
+                cached_dataset = series_info.get('cached_dataset')
+                if cached_dataset is None:
+                    # Fallback: read first file only if not cached
+                    first_file = series_info['files'][0]
+                    cached_dataset = _cached_dicom_header(first_file)
+                    if cached_dataset is None:
+                        continue
                 
                 series = SeriesInfo(
                     uid=series_uid,
                     files=series_info['files'],
                     series_number=series_info['series_number'],
                     study_datetime=study.study_datetime,
-                    first_dataset=ds,
+                    first_dataset=cached_dataset,
                     protocol_name=series_info['protocol_name'],
                     series_desc=series_info['series_desc']
                 )
@@ -1209,7 +1236,7 @@ def process_patient_worker(args):
 class BidsOrganizer:
     """Enhanced BIDS organizer with proper naming conventions and missing modality handling."""
     
-    def __init__(self, output_dir: str, action_type: str = 'copy', max_parallel_files: int = 1, max_workers: int = None, metrics_callback=None):
+    def __init__(self, output_dir: str, action_type: str = 'copy', max_parallel_files: int = 1, max_workers: int = None, metrics_callback=None, streaming_mode: bool = False):
         self.output_dir = output_dir
         self.action_type = action_type
         self.detector = EnhancedModalityDetector()
@@ -1217,6 +1244,7 @@ class BidsOrganizer:
         self.max_parallel_files = max_parallel_files  # Максимальное количество параллельных операций
         self.max_workers = max_workers  # Для параллельной обработки пациентов
         self.metrics_callback = metrics_callback  # Callback for research metrics
+        self.streaming_mode = streaming_mode  # PERFORMANCE FIX: Enable streaming processing
         
         # BIDS modality mapping
         self.bids_modality_map = {
@@ -1307,9 +1335,9 @@ class BidsOrganizer:
         results_collected = []
         errors = []
 
-        # Используем переданное количество воркеров или количество CPU
+        # PERFORMANCE FIX: Optimized parallel processing for high-memory server
         if max_workers is None:
-            max_workers = mp.cpu_count()
+            max_workers = min(mp.cpu_count(), 16)  # Increased cap for better parallel processing
         
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             # Запускаем задачи
@@ -1367,6 +1395,65 @@ class BidsOrganizer:
             logger.error(f"Errors during parallel processing: {len(errors)} patients failed")
             for error in errors[:5]:  # Показываем первые 5 ошибок
                 logger.error(f"  - {error}")
+    
+    def _process_patients_streaming(self, patient_tasks: List[tuple], patient_bids_map: Dict[str, str]):
+        """
+        PERFORMANCE FIX: Sequential streaming processing to prevent memory buildup.
+        Processes patients one by one with memory cleanup between patients.
+        """
+        logger.info("Using streaming mode - processing patients sequentially with memory cleanup")
+        
+        total_patients = len(patient_tasks)
+        for idx, task in enumerate(patient_tasks, 1):
+            patient_id = task[0]
+            bids_id = patient_bids_map[patient_id]
+            
+            logger.info(f"[{idx}/{total_patients}] Processing patient {patient_id} ({bids_id}) in streaming mode")
+            
+            try:
+                # Process single patient
+                result = process_patient_worker(task)
+                
+                # Handle result
+                if 'error' in result:
+                    logger.error(f"Patient {patient_id}: {result['error']}")
+                else:
+                    self._update_failed_cases_from_result(result)
+                    
+                    if 'selection_logs' in result and result['selection_logs']:
+                        self.selection_log.extend(result['selection_logs'])
+                    
+                    # Call metrics callback if provided
+                    if self.metrics_callback:
+                        callback_data = {
+                            'patient_id': patient_id,
+                            'detected_modalities': result.get('detected_modalities', []),
+                            'num_series_organized': result.get('num_series_organized', 0),
+                            'sessions_processed': result.get('sessions_processed', 0),
+                            'processing_status': 'success' if result.get('sessions_processed', 0) > 0 else 'failed',
+                            'sessions_with_missing': result.get('sessions_with_missing', []),
+                            'failure_reason': None if result.get('sessions_processed', 0) > 0 else 'No sessions processed'
+                        }
+                        self.metrics_callback(patient_id, callback_data)
+                    
+                    # Collect session mapping
+                    if 'session_mapping' in result and result['session_mapping']:
+                        self.session_mapping.update(result['session_mapping'])
+                
+                logger.info(f"  Completed patient {patient_id} ({bids_id})")
+                
+                # PERFORMANCE FIX: Clear cache every 10 patients to prevent memory buildup
+                if idx % 10 == 0:
+                    logger.info(f"  Clearing cache after {idx} patients...")
+                    clear_dicom_cache()
+                    import gc
+                    gc.collect()
+                    logger.info(f"  Memory cleanup completed")
+                    
+            except Exception as e:
+                logger.error(f"Failed to process patient {patient_id} in streaming mode: {e}")
+        
+        logger.info("Streaming processing completed")
     
     @measure(capture_args=True) 
     def organize_to_bids(self, collected_data: Dict[str, PatientData]):
@@ -1434,7 +1521,8 @@ class BidsOrganizer:
                         'files': series_info.files,
                         'series_number': series_info.series_number,
                         'protocol_name': series_info.protocol_name,
-                        'series_desc': series_info.series_desc
+                        'series_desc': series_info.series_desc,
+                        'cached_dataset': series_info.first_dataset  # PERFORMANCE FIX: Pass cached dataset
                     }
             
             patient_tasks.append((
@@ -1457,9 +1545,14 @@ class BidsOrganizer:
             
         logger.info(f"Processing {len(patient_tasks)} patients using {max_workers} workers")
 
-        with profiler.measure_block("parallel_patient_processing"):
-            # Всегда используем параллельную обработку (даже для 1 пациента)
-            self._process_patients_parallel(patient_tasks, patient_bids_map, self.max_workers or max_workers)
+        with profiler.measure_block("patient_processing"):
+            if self.streaming_mode and len(patient_tasks) > 10:
+                # PERFORMANCE FIX: Use streaming processing for large datasets
+                logger.info("Using streaming mode for large dataset")
+                self._process_patients_streaming(patient_tasks, patient_bids_map)
+            else:
+                # Use parallel processing for smaller datasets
+                self._process_patients_parallel(patient_tasks, patient_bids_map, self.max_workers or max_workers)
         
         # Generate selection summary
         self._generate_selection_summary()
@@ -1819,7 +1912,11 @@ class BidsOrganizer:
         sorted_files = []
         for f_path in dicom_files_paths:
             try:
-                ds_slice = pydicom.dcmread(f_path, stop_before_pixels=True, specific_tags=[(0x0020,0x0013)])
+                # PERFORMANCE FIX: Use cached header instead of re-reading file
+                ds_slice = _cached_dicom_header(f_path)
+                if ds_slice is None:
+                    # Fallback to direct read if cache fails
+                    ds_slice = pydicom.dcmread(f_path, stop_before_pixels=True, specific_tags=[(0x0020,0x0013)])
                 instance_number = get_dicom_value(ds_slice, (0x0020,0x0013))
                 if instance_number is not None:
                     try:
@@ -2074,6 +2171,12 @@ Examples:
         help='Maximum number of parallel workers (default: number of CPU cores)'
     )
     
+    parser.add_argument(
+        '--streaming-mode',
+        action='store_true',
+        help='Enable streaming mode for large datasets (processes patients sequentially with memory cleanup)'
+    )
+    
     args = parser.parse_args()
 
     start_time = time.perf_counter()
@@ -2220,7 +2323,7 @@ Examples:
                                 logger.info(f"    {modality}: '{series.protocol_name}' ({len(series.files)} files)")
             else:
                 # Phase 2: Organize to BIDS with enhanced processing
-                organizer = BidsOrganizer(args.output_dir, args.action, max_workers=args.max_workers)
+                organizer = BidsOrganizer(args.output_dir, args.action, max_workers=args.max_workers, streaming_mode=args.streaming_mode)
                 organizer.organize_to_bids(collected_data)
             
             elapsed = time.perf_counter() - start_time

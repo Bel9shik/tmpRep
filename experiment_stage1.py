@@ -37,7 +37,8 @@ class Stage1Experiment(ExperimentBase):
                  patient_list: List[str],
                  dataset_type: str = "upenn-gbm",
                  action: str = "copy",
-                 max_workers: int = None):
+                 max_workers: int = None,
+                 streaming_mode: bool = False):
         """
         Initialize Stage 1 experiment.
         
@@ -48,6 +49,7 @@ class Stage1Experiment(ExperimentBase):
             dataset_type: Dataset type ('upenn-gbm' or 'ms-dataset')
             action: File action ('copy' or 'move')
             max_workers: Number of parallel workers
+            streaming_mode: Enable streaming processing for large datasets
         """
         super().__init__(
             stage_name="stage1",
@@ -59,6 +61,7 @@ class Stage1Experiment(ExperimentBase):
         
         self.action = action
         self.max_workers = max_workers
+        self.streaming_mode = streaming_mode  # PERFORMANCE FIX: Enable streaming mode
         
         # Initialize metrics collector
         self.metrics_collector = Stage1MetricsCollector(str(self.metrics_dir))
@@ -192,7 +195,8 @@ class Stage1Experiment(ExperimentBase):
             str(self.output_dir / "rawdata"),
             self.action,
             max_workers=self.max_workers,
-            metrics_callback=self._on_patient_processed
+            metrics_callback=self._on_patient_processed,
+            streaming_mode=self.streaming_mode  # PERFORMANCE FIX: Pass streaming mode
         )
         
         organizer.organize_to_bids(all_patient_data)
@@ -378,6 +382,12 @@ def main():
         help='Number of parallel workers'
     )
     
+    parser.add_argument(
+        '--streaming-mode',
+        action='store_true',
+        help='Enable streaming mode for large datasets (recommended for 50+ patients)'
+    )
+    
     args = parser.parse_args()
     
     # Sample patients
@@ -403,7 +413,8 @@ def main():
         patient_list=patient_list,
         dataset_type=args.dataset_type,
         action=args.action,
-        max_workers=args.max_workers
+        max_workers=args.max_workers,
+        streaming_mode=args.streaming_mode  # PERFORMANCE FIX: Pass streaming mode
     )
     
     # Run experiment
