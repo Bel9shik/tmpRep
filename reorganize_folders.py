@@ -871,8 +871,8 @@ def _cached_dicom_header(file_path: str) -> Optional[pydicom.Dataset]:
         # PERFORMANCE FIX: Direct file read without mmap to avoid filesystem contention
         dataset = pydicom.dcmread(file_path, stop_before_pixels=True, specific_tags=tags)
         
-        # Cache in thread-local storage (limit cache size per thread)
-        if len(cache) < 1000:  # Limit per-thread cache to prevent memory bloat
+        # PERFORMANCE FIX: Increase cache size significantly for better hit rate
+        if len(cache) < 10000:  # 10K files per thread = 200K total cache (20 threads × 10K)
             cache[file_path] = dataset
         
         return dataset
@@ -984,9 +984,8 @@ class DicomScanner:
         # Шаг 2: Параллельная обработка файлов
         logger.info("  Processing files in parallel...")
         
-        # PERFORMANCE FIX: Optimal threading for 20-core server (avoid GIL contention)
-        # For I/O-bound tasks with GIL, optimal is ~2x CPU cores, not 4x
-        max_workers = min(20, os.cpu_count() * 1)  # Match server's 20 threads, avoid GIL contention
+        # PERFORMANCE FIX: Use ALL 20 threads on server for maximum throughput
+        max_workers = 20  # Use all available threads on 20-core server
         
         # PERFORMANCE FIX: Lock-free parallel processing with batch collection
         # Collect all results first, then merge without locks
@@ -1400,7 +1399,7 @@ def process_patient_worker(args):
 class BidsOrganizer:
     """Enhanced BIDS organizer with proper naming conventions and missing modality handling."""
     
-    def __init__(self, output_dir: str, action_type: str = 'copy', max_parallel_files: int = 1, max_workers: int = None, metrics_callback=None, streaming_mode: bool = False):
+    def __init__(self, output_dir: str, action_type: str = 'copy', max_parallel_files: int = 20, max_workers: int = None, metrics_callback=None, streaming_mode: bool = False):
         self.output_dir = output_dir
         self.action_type = action_type
         self.detector = EnhancedModalityDetector()
@@ -1437,8 +1436,8 @@ class BidsOrganizer:
             file_operations: Список кортежей (source_path, destination_path)
             operation_type: 'copy' или 'move'
         """
-        # Определяем количество потоков (для I/O операций можно использовать больше потоков чем CPU)
-        max_workers = min(self.max_parallel_files, os.cpu_count() * 4)
+        # PERFORMANCE FIX: Use all available threads for file operations
+        max_workers = min(self.max_parallel_files, 20)  # Use all 20 threads for file copying
         
         # Счетчики для логирования прогресса
         total_files = len(file_operations)
@@ -1499,9 +1498,9 @@ class BidsOrganizer:
         results_collected = []
         errors = []
 
-        # PERFORMANCE FIX: Optimized parallel processing for high-memory server
+        # PERFORMANCE FIX: Use ALL 20 cores for patient organization (critical bottleneck)
         if max_workers is None:
-            max_workers = min(mp.cpu_count(), 16)  # Increased cap for better parallel processing
+            max_workers = 20  # Use all 20 cores - organization is the main bottleneck
         
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             # Запускаем задачи
@@ -1702,7 +1701,7 @@ class BidsOrganizer:
         if self.max_workers:
             max_workers = self.max_workers
         else:
-            max_workers = min(mp.cpu_count(), len(patient_tasks))
+            max_workers = min(20, len(patient_tasks))  # Use all 20 cores up to number of patients
 
         # Но если только 1 пациент, используем 1 воркер
         if len(patient_tasks) == 1:
@@ -2053,23 +2052,24 @@ class BidsOrganizer:
             dst_file_path = os.path.join(bids_modality_dir, bids_filename)
             file_operations.append((src_file_path, dst_file_path))
         
-        # Измеряем время копирования
+        # PERFORMANCE FIX: Always use parallel copying for ANY number of files
+        # The 45-second bottleneck is here - sequential file copying!
         with profiler.measure_block(f"parallel_{self.action_type}_{len(sorted_files)}_files"):
-            # Используем параллельное копирование для больших серий
-            if len(file_operations) > 10:  # Порог для использования параллельного копирования
+            # ALWAYS use parallel copying - even for small series
+            if len(file_operations) > 1:  # Use parallel for 2+ files
                 errors = self._parallel_copy_files(file_operations, self.action_type)
                 if errors:
                     logger.warning(f"    {len(errors)} files failed during {self.action_type}")
             else:
-                # Для маленьких серий используем последовательное копирование
-                for src_file_path, dst_file_path in file_operations:
-                    try:
-                        if self.action_type == 'move':
-                            shutil.move(src_file_path, dst_file_path)
-                        else:
-                            shutil.copyfile(src_file_path, dst_file_path)
-                    except Exception as e:
-                        logger.error(f"Failed to {self.action_type} {src_file_path} -> {dst_file_path}: {e}")
+                # Only single file - do direct copy
+                src_file_path, dst_file_path = file_operations[0]
+                try:
+                    if self.action_type == 'move':
+                        shutil.move(src_file_path, dst_file_path)
+                    else:
+                        shutil.copyfile(src_file_path, dst_file_path)
+                except Exception as e:
+                    logger.error(f"Failed to {self.action_type} {src_file_path} -> {dst_file_path}: {e}")
     
     @measure
     def _sort_files_by_instance_number(self, dicom_files_paths: List[str]) -> List[str]:
