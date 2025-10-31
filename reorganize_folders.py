@@ -1449,10 +1449,14 @@ class BidsOrganizer:
             """Копирование одного файла с обработкой ошибок."""
             src, dst = src_dst_pair
             try:
+                # PERFORMANCE FIX: Optimize I/O operations for large datasets
+                os.makedirs(os.path.dirname(dst), exist_ok=True)  # Ensure directory exists
+                
                 if operation_type == 'move':
                     shutil.move(src, dst)
                 else:
-                    shutil.copyfile(src, dst)  # copyfile быстрее чем copy
+                    # PERFORMANCE FIX: Use copy2 with buffering for better I/O performance
+                    shutil.copy2(src, dst)  # copy2 preserves metadata and uses larger buffers
                 
                 # Обновляем счетчик
                 nonlocal completed
@@ -1498,9 +1502,10 @@ class BidsOrganizer:
         results_collected = []
         errors = []
 
-        # PERFORMANCE FIX: Use ALL 20 cores for patient organization (critical bottleneck)
+        # PERFORMANCE FIX: Reduce concurrent I/O pressure to prevent disk saturation
+        # Too many concurrent writes cause I/O bottleneck after 70 patients
         if max_workers is None:
-            max_workers = 20  # Use all 20 cores - organization is the main bottleneck
+            max_workers = min(8, mp.cpu_count())  # Limit to 8 concurrent patients to reduce I/O pressure
         
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             # Запускаем задачи
@@ -1605,13 +1610,27 @@ class BidsOrganizer:
                 
                 logger.info(f"  Completed patient {patient_id} ({bids_id})")
                 
-                # PERFORMANCE FIX: Clear cache every 10 patients to prevent memory buildup
-                if idx % 10 == 0:
-                    logger.info(f"  Clearing cache after {idx} patients...")
+                # PERFORMANCE FIX: Add I/O sync and reduce concurrent pressure periodically
+                if idx % 25 == 0:  # Every 25 patients - balance between memory and I/O
+                    logger.info(f"  Performing maintenance after {idx} patients...")
+                    
+                    # Force filesystem sync to prevent I/O queue buildup
+                    try:
+                        os.sync()  # Force kernel to flush dirty pages
+                        logger.info(f"    Filesystem sync completed")
+                    except:
+                        pass  # sync() may not be available on all systems
+                    
+                    # Clear cache and garbage collect
                     clear_dicom_cache()
                     import gc
                     gc.collect()
-                    logger.info(f"  Memory cleanup completed")
+                    logger.info(f"    Memory cleanup completed")
+                    
+                    # Brief pause to let I/O subsystem recover
+                    import time
+                    time.sleep(1)
+                    logger.info(f"  Maintenance completed, resuming processing...")
                     
             except Exception as e:
                 logger.error(f"Failed to process patient {patient_id} in streaming mode: {e}")
@@ -1710,13 +1729,10 @@ class BidsOrganizer:
         logger.info(f"Processing {len(patient_tasks)} patients using {max_workers} workers")
 
         with profiler.measure_block("patient_processing"):
-            if self.streaming_mode and len(patient_tasks) > 10:
-                # PERFORMANCE FIX: Use streaming processing for large datasets
-                logger.info("Using streaming mode for large dataset")
-                self._process_patients_streaming(patient_tasks, patient_bids_map)
-            else:
-                # Use parallel processing for smaller datasets
-                self._process_patients_parallel(patient_tasks, patient_bids_map, self.max_workers or max_workers)
+            # PERFORMANCE FIX: ALWAYS use parallel processing - streaming is too slow!
+            # Streaming mode causes 10-minute delays per patient after cache clear
+            logger.info(f"Using parallel processing for maximum performance ({max_workers} workers)")
+            self._process_patients_parallel(patient_tasks, patient_bids_map, self.max_workers or max_workers)
         
         # Generate selection summary
         self._generate_selection_summary()
@@ -2064,10 +2080,14 @@ class BidsOrganizer:
                 # Only single file - do direct copy
                 src_file_path, dst_file_path = file_operations[0]
                 try:
+                    # PERFORMANCE FIX: Ensure directory exists and optimize I/O
+                    os.makedirs(os.path.dirname(dst_file_path), exist_ok=True)
+                    
                     if self.action_type == 'move':
                         shutil.move(src_file_path, dst_file_path)
                     else:
-                        shutil.copyfile(src_file_path, dst_file_path)
+                        # PERFORMANCE FIX: Use copy2 for better I/O performance
+                        shutil.copy2(src_file_path, dst_file_path)
                 except Exception as e:
                     logger.error(f"Failed to {self.action_type} {src_file_path} -> {dst_file_path}: {e}")
     
