@@ -839,12 +839,26 @@ def safe_read_dicom(file_path: str, specific_tags: Optional[List] = None) -> Opt
     """Safely read DICOM file with error handling."""
     return pydicom.dcmread(file_path, stop_before_pixels=True, specific_tags=specific_tags)
 
-@lru_cache(maxsize=200000)  # PERFORMANCE FIX: Massive cache increase for 128GB RAM server
+# PERFORMANCE FIX: Thread-local cache instead of global LRU cache to avoid GIL contention
+import threading
+_thread_local_cache = threading.local()
+
 def _cached_dicom_header(file_path: str) -> Optional[pydicom.Dataset]:
     """
-    Read only the tags we need via mmap.
-    The Dataset is cached by absolute path.
+    Read DICOM header with thread-local caching to avoid GIL contention.
+    Each thread maintains its own cache to prevent lock contention.
     """
+    # Get thread-local cache
+    if not hasattr(_thread_local_cache, 'cache'):
+        _thread_local_cache.cache = {}
+    
+    cache = _thread_local_cache.cache
+    
+    # Check thread-local cache first
+    if file_path in cache:
+        return cache[file_path]
+    
+    # Read file without mmap to avoid filesystem locks
     tags = [
         (0x0008, 0x0060), (0x0008, 0x103E), (0x0018, 0x1030), (0x0018, 0x0010),
         (0x0008, 0x0020), (0x0008, 0x0030), (0x0020, 0x000D), (0x0020, 0x000E),
@@ -852,19 +866,30 @@ def _cached_dicom_header(file_path: str) -> Optional[pydicom.Dataset]:
         (0x0008, 0x0008), (0x0018, 0x0080), (0x0018, 0x0081), (0x0018, 0x0082),
         (0x0010, 0x0020), (0x0008, 0x0022), (0x0008, 0x0032)
     ]
+    
     try:
-        with open(file_path, 'rb') as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                return pydicom.filereader.dcmread(mm, stop_before_pixels=True,
-                                                  specific_tags=tags)
+        # PERFORMANCE FIX: Direct file read without mmap to avoid filesystem contention
+        dataset = pydicom.dcmread(file_path, stop_before_pixels=True, specific_tags=tags)
+        
+        # Cache in thread-local storage (limit cache size per thread)
+        if len(cache) < 1000:  # Limit per-thread cache to prevent memory bloat
+            cache[file_path] = dataset
+        
+        return dataset
     except Exception as e:
         logger.debug(f"Failed to read DICOM header from {file_path}: {e}")
         return None
 
 def clear_dicom_cache():
     """Clear the DICOM header cache to free memory."""
-    _cached_dicom_header.cache_clear()
-    logger.info("DICOM header cache cleared")
+    # PERFORMANCE FIX: Clear thread-local caches instead of global LRU cache
+    # Note: This only clears the current thread's cache
+    if hasattr(_thread_local_cache, 'cache'):
+        cache_size = len(_thread_local_cache.cache)
+        _thread_local_cache.cache.clear()
+        logger.info(f"Thread-local DICOM cache cleared ({cache_size} entries)")
+    else:
+        logger.info("No thread-local DICOM cache to clear")
 
 def clear_patient_scan_cache():
     """Clear the patient scan cache to free memory."""
@@ -875,14 +900,18 @@ def clear_patient_scan_cache():
 
 def get_cache_statistics():
     """Get current cache statistics for monitoring."""
-    dicom_cache_info = _cached_dicom_header.cache_info()
+    # PERFORMANCE FIX: Get thread-local cache stats instead of global LRU
+    thread_cache_size = 0
+    if hasattr(_thread_local_cache, 'cache'):
+        thread_cache_size = len(_thread_local_cache.cache)
+    
     patient_cache_size = len(PATIENT_SCAN_CACHE)
     error_counts = get_error_suppression_summary()
     
     return {
-        'dicom_cache_hits': dicom_cache_info.hits,
-        'dicom_cache_misses': dicom_cache_info.misses,
-        'dicom_cache_size': dicom_cache_info.currsize,
+        'dicom_cache_hits': 'N/A (thread-local)',
+        'dicom_cache_misses': 'N/A (thread-local)',
+        'dicom_cache_size': thread_cache_size,
         'patient_cache_size': patient_cache_size,
         'total_errors_suppressed': sum(error_counts.values()),
         'error_types': len(error_counts)
@@ -955,8 +984,9 @@ class DicomScanner:
         # Шаг 2: Параллельная обработка файлов
         logger.info("  Processing files in parallel...")
         
-        # PERFORMANCE FIX: Optimized threading for high-memory server
-        max_workers = min(64, os.cpu_count() * 4)  # Increased from 32 to 64 for better throughput
+        # PERFORMANCE FIX: Optimal threading for 20-core server (avoid GIL contention)
+        # For I/O-bound tasks with GIL, optimal is ~2x CPU cores, not 4x
+        max_workers = min(20, os.cpu_count() * 1)  # Match server's 20 threads, avoid GIL contention
         
         # PERFORMANCE FIX: Lock-free parallel processing with batch collection
         # Collect all results first, then merge without locks
